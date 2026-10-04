@@ -15,7 +15,7 @@ import os
 import time
 import traceback
 from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import logging
@@ -71,6 +71,43 @@ def _sniff_image_mime(data: bytes, fallback: str = "image/png") -> str:
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "image/webp"
     return fallback
+
+
+def _data_uri(data: bytes, content_type: str = "") -> str:
+    """Encode image bytes as a single ``data:<mime>;base64,<payload>`` URI."""
+    mime = content_type.split(";")[0].strip()
+    if not mime.startswith("image/"):
+        mime = _sniff_image_mime(data)
+    return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
+
+
+def _image_tool_result(data: bytes) -> JSONResponse:
+    """Shape the response for chat-webui's tool-result handling.
+
+    The contract, taken from chat_webui/utils/tools.py and middleware.py:
+
+    * ``execute_tool_server`` ends with ``return await response.json()`` with no
+      fallback, so the body MUST be valid JSON. Raw image bytes give
+      "Attempt to decode JSON with unexpected mimetype: image/png".
+    * ``extract_data_url_files_from_tool_result`` only splits *top-level list
+      elements* that are strings starting with ``data:``. This fork has no
+      recursive scan of dict values, so a data URI nested in an object is
+      invisible to it and becomes model context text.
+    * Those elements become ``image_url`` content blocks, so the model receives
+      the picture itself instead of hundreds of thousands of base64 tokens.
+
+    Hence: a JSON array whose elements are the data URI and a short instruction.
+    """
+    return JSONResponse(
+        content=[
+            _data_uri(data),
+            (
+                "Screenshot captured and already shown to the user in this chat. "
+                "Do not embed the image or repeat its data; just describe what it "
+                "shows."
+            ),
+        ]
+    )
 
 
 # Rendering a page with headless Chrome routinely takes longer than httpx's
@@ -380,21 +417,28 @@ async def _fetch_screenshot_bytes(
     summary="Fetch screenshot of a URL",
     operation_id="get_screenshot",
     description=(
-        "Returns a screenshot of the given URL as a single image data URI. "
-        "The optional `debug` parameter only affects diagnostics: pass 2 to get a "
-        "JSON error report instead of an HTTP error when the page cannot be "
-        "rendered, which is useful for troubleshooting."
+        "Returns a screenshot of the given URL as JSON: a two-element array whose "
+        "first element is the image as a data URI and whose second element is a "
+        "short note for the model. The data URI must stay a top-level array "
+        "element, not a value inside an object, or the chat client cannot attach "
+        "the image. The optional `debug` parameter only affects diagnostics: pass "
+        "2 to get a JSON error report instead of an HTTP error when the page "
+        "cannot be rendered, which is useful for troubleshooting."
     ),
     responses={
         200: {
             "description": (
-                "The screenshot as raw PNG bytes (Content-Type: image/png). "
-                "Open WebUI base64-encodes non-text tool responses into an image "
-                "data URI and attaches it to the chat, keeping it out of the "
-                "model context. Do not wrap this in JSON: a text/plain or "
-                "application/json body is parsed as text and blows up the context."
+                "JSON array: [0] the screenshot as a data:image/...;base64 URI, "
+                "[1] a note telling the model the image is already displayed."
             ),
-            "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}},
+            "content": {
+                "application/json": {
+                    "example": [
+                        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg...",
+                        "Screenshot captured and already shown to the user in this chat.",
+                    ]
+                }
+            },
         }
     },
 )
@@ -438,15 +482,16 @@ async def get_screenshot(
                 "mime": mime,
                 "image_bytes": len(data),
                 "base64_chars_when_encoded": 4 * ((len(data) + 2) // 3),
-                "returned_as": f"{mime} bytes (Open WebUI encodes these itself)",
+                "returned_as": (
+                    f"JSON array [{mime} data URI, note] - data URI must stay a "
+                    "top-level array element for chat-webui to attach it"
+                ),
                 "magic_bytes": data[:8].hex(),
             }
         )
 
     logger.info("screenshot %s -> %d bytes of %s", url, len(data), mime)
-    # Raw image bytes: Open WebUI turns a non-text tool response into an image
-    # data URI and attaches it, instead of injecting base64 into the context.
-    return Response(content=data, media_type=mime)
+    return _image_tool_result(data)
 
 
 # Pageshot endpoint
@@ -457,12 +502,20 @@ async def get_screenshot(
     responses={
         200: {
             "description": (
-                "The full page screenshot as raw PNG bytes (Content-Type: "
-                "image/png). Open WebUI base64-encodes non-text tool responses "
-                "into an image data URI and attaches it to the chat, keeping it "
-                "out of the model context. Note these can be several MB."
+                "JSON array: [0] the full page screenshot as a data:image/... "
+                "URI, [1] a note for the model. Must stay JSON - "
+                "execute_tool_server calls response.json() with no fallback, and "
+                "the data URI has to be a top-level array element. Full page "
+                "shots can be several MB, so expect a very large payload."
             ),
-            "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}},
+            "content": {
+                "application/json": {
+                    "example": [
+                        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg...",
+                        "Screenshot captured and already shown to the user in this chat.",
+                    ]
+                }
+            },
         }
     },
 )
@@ -470,8 +523,8 @@ async def get_pageshot(url: str):
     data = await _fetch_screenshot_bytes(url, "pageshot")
     mime = _sniff_image_mime(data, fallback="image/png")
     logger.info("pageshot %s -> %d bytes of %s", url, len(data), mime)
-    # Raw image bytes, same contract as get_screenshot.
-    return Response(content=data, media_type=mime)
+    # Same contract as get_screenshot.
+    return _image_tool_result(data)
 
 
 @app.get(
@@ -573,19 +626,18 @@ async def debug_reader(
     """
     logger.info("%s debug/reader requested for %s", LOG_TAG, url)
 
-    # What Open WebUI receives from OUR endpoint (not from the reader): this is
-    # the response whose Content-Type must not be text/plain or JSON.
+    # What chat-webui receives from OUR endpoint (not from the reader).
     try:
         data = await _fetch_screenshot_bytes(url, respond_with)
         mime = _sniff_image_mime(data, fallback="(unrecognised)")
         tool_contract = {
-            "content_type_served": mime,
-            "bytes": len(data),
+            "image_mime": mime,
+            "image_bytes": len(data),
             "ok": mime.startswith("image/"),
-            "note": (
-                "Open WebUI base64-encodes a non-text response into an image "
-                "data URI and attaches it; a text/plain or JSON body is parsed "
-                "as text instead and blows up the model context."
+            "served_as": (
+                "JSON array [data URI, note]; the data URI is a top-level array "
+                "element, which is what chat-webui's "
+                "extract_data_url_files_from_tool_result splits into files"
             ),
             "base64_chars_when_encoded": 4 * ((len(data) + 2) // 3),
         }
