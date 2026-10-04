@@ -31,6 +31,10 @@ RUN npm ci
 # Copy the rest of the application code
 COPY backend/functions .
 
+# Copy the build-time patch (kept outside backend/ so it stays with this repo
+# rather than the upstream tree).
+COPY patch-puppeteer.cjs .
+
 # Build the application
 RUN npm run build
 
@@ -41,11 +45,9 @@ RUN npm run build
 #   TargetCloseError: Protocol error (Target.createTarget): Target closed
 # That error is also emitted as an unhandled 'error' event, which kills the Node
 # process -> restart loop -> every crawl answers 500 in ~0.3s.
-# Strip the flag from the compiled output; the build fails if the pattern is
-# missing, so an upstream change cannot silently reintroduce the bug.
-RUN sed -i "s/'--single-process',//g" build/services/puppeteer.js \
- && ! grep -q -- "--single-process" build/services/puppeteer.js \
- && echo "patched: --single-process removed from build/services/puppeteer.js"
+# The script exits non-zero if the flag is absent or survives, so the build
+# fails loudly instead of silently shipping a broken crawler.
+RUN node patch-puppeteer.cjs
 
 # Create local storage directory and set permissions
 RUN mkdir -p /app/local-storage && chmod 777 /app/local-storage
