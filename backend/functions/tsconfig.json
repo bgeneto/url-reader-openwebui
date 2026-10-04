@@ -1,0 +1,23 @@
+{
+    "compilerOptions": {
+        "module": "node16",
+
+        "noImplicitReturns": true,
+        "noUnusedLocals": false,
+        "outDir": "build",
+        "sourceMap": true,
+        "strict": true,
+        "allowJs": true,
+        "target": "es2022",
+        "lib": ["es2022"],
+        "skipLibCheck": true,
+        "useDefineForClassFields": false,
+        "experimentalDecorators": true,
+        "emitDecoratorMetadata": true,
+        "esModuleInterop": true,
+        "noImplicitAny": false,
+        "noImplicitOverride": true,
+    },
+    "compileOnSave": true,
+    "include": ["src"]
+}
