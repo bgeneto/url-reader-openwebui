@@ -9,6 +9,7 @@ Version: 1.0.4
 Last Modified: 2025-07-02
 """
 
+import asyncio
 import base64
 import os
 import time
@@ -93,6 +94,9 @@ def _as_image_data_uri(data: bytes, content_type: str = "") -> str:
 SCREENSHOT_TIMEOUT = float(os.getenv("SCREENSHOT_TIMEOUT", "90"))
 # Ask the reader for more time; it caps X-Timeout at 180 seconds anyway.
 CRAWL_TIMEOUT_SECONDS = int(os.getenv("CRAWL_TIMEOUT_SECONDS", "60"))
+# Headless Chrome in the reader container fails intermittently (crashed or
+# recycled browser). Retrying a 5xx usually succeeds, so one chat turn survives.
+SCREENSHOT_MAX_ATTEMPTS = int(os.getenv("SCREENSHOT_MAX_ATTEMPTS", "3"))
 
 # Lightweight counters so GET /debug/status can show recent activity at a glance.
 _stats = {"requests": 0, "ok": 0, "failed": 0, "last_error": None, "last_url": None}
@@ -207,12 +211,10 @@ async def get_text(url: str):
     return await _fetch_content(url, "plain")
 
 
-async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = None) -> bytes:
-    """Ask the reader for a screenshot and return the PNG bytes.
-
-    Kept separate from _fetch_content so failures carry the upstream status and
-    body instead of httpx's generic "Server error '500 ...'" text.
-    """
+async def _request_screenshot_once(
+    url: str, respond_with: str, params: dict = None, attempt: int = 1
+) -> bytes:
+    """One attempt at fetching a screenshot from the reader."""
     decoded_url = unquote(url)
     target_url = f"{READER_BASE_URL}/{decoded_url}"
     # X-Timeout is capped at 180s by the reader; headers win over query params.
@@ -223,9 +225,11 @@ async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = No
     }
 
     logger.info(
-        "%s request: respond_with=%s url=%s params=%s "
+        "%s request (attempt %d/%d): respond_with=%s url=%s params=%s "
         "(client timeout=%ss, X-Timeout=%ss)",
         LOG_TAG,
+        attempt,
+        SCREENSHOT_MAX_ATTEMPTS,
         respond_with,
         decoded_url,
         params or {},
@@ -233,8 +237,6 @@ async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = No
         crawl_timeout,
     )
 
-    _stats["requests"] += 1
-    _stats["last_url"] = decoded_url
     started = time.monotonic()
     async with httpx.AsyncClient(timeout=SCREENSHOT_TIMEOUT) as client:
         try:
@@ -281,7 +283,6 @@ async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = No
                     LOG_TAG,
                     response.content[:8],
                 )
-            _stats["ok"] += 1
             return response.content
 
         except httpx.HTTPStatusError as e:
@@ -296,19 +297,14 @@ async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = No
                 decoded_url,
                 body,
             )
-            hint = ""
-            if status >= 500:
-                hint = (
-                    " The reader's headless Chrome failed to render the page "
-                    "(see `docker compose logs url-reader-app`); it is usually a "
-                    "render timeout, a crashed browser, or a blocked page."
-                )
-            _stats["failed"] += 1
-            _stats["last_error"] = f"upstream {status}: {body[:200]}"
-            raise HTTPException(
+            # 5xx from the reader is usually its headless Chrome; mark retryable
+            # by attaching the flag, the wrapper below acts on it.
+            exc = HTTPException(
                 status_code=502,
-                detail=f"Reader backend returned {status} for {decoded_url}: {body}{hint}",
+                detail=f"Reader backend returned {status} for {decoded_url}: {body}",
             )
+            setattr(exc, "retryable", status >= 500)
+            raise exc
         except httpx.TimeoutException as e:
             elapsed = time.monotonic() - started
             logger.error(
@@ -319,9 +315,7 @@ async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = No
                 decoded_url,
                 e,
             )
-            _stats["failed"] += 1
-            _stats["last_error"] = f"timeout after {SCREENSHOT_TIMEOUT:.0f}s: {e}"
-            raise HTTPException(
+            exc = HTTPException(
                 status_code=504,
                 detail=(
                     f"Reader backend did not answer within {SCREENSHOT_TIMEOUT:.0f}s "
@@ -329,6 +323,8 @@ async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = No
                     f"longer SCREENSHOT_TIMEOUT or a smaller viewport."
                 ),
             )
+            setattr(exc, "retryable", True)
+            raise exc
         except httpx.HTTPError as e:
             elapsed = time.monotonic() - started
             logger.error(
@@ -338,12 +334,60 @@ async def _fetch_screenshot_bytes(url: str, respond_with: str, params: dict = No
                 decoded_url,
                 e,
             )
-            _stats["failed"] += 1
-            _stats["last_error"] = f"transport error: {e}"
-            raise HTTPException(
+            exc = HTTPException(
                 status_code=502,
                 detail=f"Could not reach the reader backend for {decoded_url}: {e}",
             )
+            setattr(exc, "retryable", True)
+            raise exc
+
+
+async def _fetch_screenshot_bytes(
+    url: str, respond_with: str, params: dict = None
+) -> bytes:
+    """Fetch a screenshot, retrying transient reader failures.
+
+    The reader's headless Chrome fails intermittently (crashed or recycled
+    browser); it health-checks and relaunches itself every 30s, so a short retry
+    usually rides that out and keeps the chat turn alive.
+    """
+    _stats["requests"] += 1
+    _stats["last_url"] = unquote(url)
+
+    last_error: HTTPException | None = None
+    for attempt in range(1, max(SCREENSHOT_MAX_ATTEMPTS, 1) + 1):
+        try:
+            data = await _request_screenshot_once(url, respond_with, params, attempt)
+            _stats["ok"] += 1
+            return data
+        except HTTPException as e:
+            last_error = e
+            retryable = getattr(e, "retryable", False)
+            if not retryable or attempt >= max(SCREENSHOT_MAX_ATTEMPTS, 1):
+                break
+            backoff = 2 ** (attempt - 1)
+            logger.warning(
+                "%s attempt %d/%d failed (%s); retrying in %ss",
+                LOG_TAG,
+                attempt,
+                SCREENSHOT_MAX_ATTEMPTS,
+                e.detail,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+
+    _stats["failed"] += 1
+    detail = last_error.detail if last_error else "unknown error"
+    _stats["last_error"] = detail[:200]
+    status = last_error.status_code if last_error else 502
+
+    if status == 502 and "returned 5" in detail:
+        detail += (
+            f" The reader's headless Chrome failed all {max(SCREENSHOT_MAX_ATTEMPTS, 1)} "
+            "attempt(s). Check `docker compose logs url-reader-app` for "
+            "'Unhandled error in scrap method' or 'Failed to finalize'."
+        )
+    raise HTTPException(status_code=status, detail=detail)
 
 
 # Screenshot endpoint with dimensions
@@ -469,6 +513,7 @@ async def debug_status():
         "reader_base_url": READER_BASE_URL,
         "client_timeout_s": SCREENSHOT_TIMEOUT,
         "crawl_timeout_s": CRAWL_TIMEOUT_SECONDS,
+        "max_attempts": SCREENSHOT_MAX_ATTEMPTS,
         "webui_needs": "tool result must be one whole image data URI",
         "stats": dict(_stats),
     }

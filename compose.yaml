@@ -9,8 +9,15 @@ services:
     # and should match the READER_BASE_URL in main.py
     # If you change this, also update the READER_BASE_URL in main.py
     container_name: url-reader-app
-    #ports:
-    #  - "3000:3000"
+    # Expose the reader directly for debugging, e.g.
+    #   curl -H 'X-Respond-With: screenshot' -o shot.png \
+    #        'http://127.0.0.1:3000/https://example.com/'
+    # (the openapi/python wrapper is the normal entry point; see url-reader-server).
+    ports:
+      - "3000:3000"
+    # Headless Chrome writes a lot to /dev/shm. Without this it crashes on pages
+    # that use SharedArrayBuffer or render many layers, and the reader answers 500.
+    shm_size: "1gb"
     volumes:
       - ./screenshots:/app/local-storage
     restart: always
@@ -28,8 +35,9 @@ services:
     image: url-reader-server:latest
     hostname: url-reader-server
     container_name: url-reader-server
-    #ports:
-    #  - "8000:8000"
+    # Debug endpoints live here: /debug/status and /screenshot/<url>?debug=1
+    ports:
+      - "8000:8000"
     restart: always
     depends_on:
       - url-reader-app
