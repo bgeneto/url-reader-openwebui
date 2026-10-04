@@ -1,0 +1,45 @@
+services:
+  url-reader-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.reader
+    image: url-reader-app:latest
+    hostname: url-reader-app # do NOT change this, it is used in the main.py file
+    # This hostname is used to access the app from the server container
+    # and should match the READER_BASE_URL in main.py
+    # If you change this, also update the READER_BASE_URL in main.py
+    container_name: url-reader-app
+    #ports:
+    #  - "3000:3000"
+    volumes:
+      - ./screenshots:/app/local-storage
+    restart: always
+    environment:
+      PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
+      PUPPETEER_EXECUTABLE_PATH: "/usr/bin/google-chrome-stable"
+    command: node build/server.js
+    networks:
+      - default
+
+  url-reader-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: url-reader-server:latest
+    hostname: url-reader-server
+    container_name: url-reader-server
+    #ports:
+    #  - "8000:8000"
+    restart: always
+    depends_on:
+      - url-reader-app
+    volumes:
+      - ./main.py:/app/main.py
+      - ./screenshots:/app/screenshots
+    networks:
+      - default
+      - chatwebui
+
+networks:
+  chatwebui:
+    external: true

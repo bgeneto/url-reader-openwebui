@@ -1,0 +1,17 @@
+node_modules/
+.DS_Store
+/package-lock.json
+.aider*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local backups and scratch files
+*.bak
+_verify_fix.py
+screenshots/.writetest
+
+# Runtime output (screenshots are stored here by url-reader-app)
+screenshots/*
+!screenshots/.gitkeep
