@@ -546,6 +546,69 @@ async def debug_status():
     return JSONResponse(content=result)
 
 
+async def _proxy_to_reader(
+    path: str, headers: dict = None, params: dict = None, limit: int = 2000
+) -> dict:
+    """Fetch from the reader without following redirects, for diagnostics only.
+
+    `path` is appended to READER_BASE_URL verbatim, so it can be a bare route
+    like 'favicon.ico' (which the reader answers 404 text/plain) or a full URL.
+    """
+    url = f"{READER_BASE_URL}/{path}"
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                url, headers=headers or {}, params=params, follow_redirects=False
+            )
+        return {
+            "requested_url": url,
+            "status": response.status_code,
+            "content_type": response.headers.get("content-type", "(none)"),
+            "location": response.headers.get("location"),
+            "server": response.headers.get("server"),
+            "bytes": len(response.content),
+            "elapsed_s": round(time.monotonic() - started, 2),
+            "body": response.text[:limit],
+        }
+    except httpx.HTTPError as e:
+        return {
+            "requested_url": url,
+            "error": f"{type(e).__name__}: {e}",
+            "elapsed_s": round(time.monotonic() - started, 2),
+        }
+
+
+@app.get(
+    "/debug/reader",
+    summary="Diagnostics: replay a reader request and return its raw response.",
+)
+async def debug_reader(
+    url: str = Query(..., description="Target URL to screenshot, e.g. https://example.com/"),
+    respond_with: str = Query("screenshot", description="X-Respond-With value"),
+):
+    """Show exactly what the reader returns, instead of a bare 500.
+
+    Open in a browser, e.g.
+      /debug/reader?url=https://example.com/
+      /debug/reader?respond_with=text&url=https://example.com/
+    The bare 'favicon.ico' probe is always included: it proves the Node process
+    is alive and serving *before* any headless Chrome is involved.
+    """
+    logger.info("%s debug/reader requested for %s", LOG_TAG, url)
+    result = {
+        # No Chrome needed: if this fails, the reader process itself is unwell.
+        "process_alive": await _proxy_to_reader("favicon.ico", limit=200),
+        "screenshot_request": await _proxy_to_reader(
+            unquote(url),
+            headers={"X-Respond-With": respond_with, "X-Timeout": "60"},
+            limit=2000,
+        ),
+    }
+    logger.info("%s debug/reader result: %s", LOG_TAG, result)
+    return JSONResponse(content=result)
+
+
 @app.get(
     "/",
     summary="Retrieve URL content in LLM-friendly formats like markdown, text and others like screenshots.",
@@ -560,6 +623,7 @@ async def root():
             "screenshot": "/screenshot/{url}",
             "pageshot": "/pageshot/{url}",
             "debug_status": "/debug/status",
+            "debug_reader": "/debug/reader?url={url}",
         },
     }
 

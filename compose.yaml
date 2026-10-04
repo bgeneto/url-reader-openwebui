@@ -9,12 +9,12 @@ services:
     # and should match the READER_BASE_URL in main.py
     # If you change this, also update the READER_BASE_URL in main.py
     container_name: url-reader-app
-    # Expose the reader directly for debugging, e.g.
-    #   curl -H 'X-Respond-With: screenshot' -o shot.png \
-    #        'http://127.0.0.1:3000/https://example.com/'
-    # (the openapi/python wrapper is the normal entry point; see url-reader-server).
-    ports:
-      - "3000:3000"
+    # Deliberately NOT published: this service only needs to be reachable by
+    # url-reader-server over the internal docker network. For a one-off manual
+    # check, run a shell inside the network instead of exposing a port:
+    #   docker run --rm --network url-reader_default curlimages/curl:latest \
+    #     -s -o /dev/null -w '%{http_code}\n' -H 'X-Respond-With: screenshot' \
+    #     'http://url-reader-app:3000/https://example.com/'
     # Headless Chrome writes a lot to /dev/shm. Without this it crashes on pages
     # that use SharedArrayBuffer or render many layers, and the reader answers 500.
     shm_size: "1gb"
@@ -22,8 +22,15 @@ services:
       - ./screenshots:/app/local-storage
     restart: always
     environment:
+      # Point Puppeteer at the Debian `chromium` package (already installed by
+      # Dockerfile.reader) rather than `google-chrome-stable`, which is the
+      # binary that dies during launch here:
+      #   TargetCloseError: Protocol error (Target.setDiscoverTargets): Target closed
+      # PuppeteerControl emits an unhandled 'error' event for that, so the whole
+      # Node process exits -> restart loop -> every crawl answers 500 in ~0.25s.
+      # Switch back to "/usr/bin/google-chrome-stable" if this one misbehaves.
       PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
-      PUPPETEER_EXECUTABLE_PATH: "/usr/bin/google-chrome-stable"
+      PUPPETEER_EXECUTABLE_PATH: "/usr/bin/chromium"
     command: node build/server.js
     networks:
       - default
@@ -35,9 +42,11 @@ services:
     image: url-reader-server:latest
     hostname: url-reader-server
     container_name: url-reader-server
-    # Debug endpoints live here: /debug/status and /screenshot/<url>?debug=1
-    ports:
-      - "8000:8000"
+    # Also not published. Open WebUI reaches it as http://url-reader-server:8000
+    # on the shared `chatwebui` network, and the debug endpoints (/debug/status,
+    # /debug/reader) can be reached the same way from any container on it, e.g.
+    #   docker run --rm --network chatwebui curlimages/curl:latest \
+    #     -s 'http://url-reader-server:8000/debug/status'
     restart: always
     depends_on:
       - url-reader-app
