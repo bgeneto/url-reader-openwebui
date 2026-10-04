@@ -15,7 +15,7 @@ import os
 import time
 import traceback
 from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import logging
@@ -71,22 +71,6 @@ def _sniff_image_mime(data: bytes, fallback: str = "image/png") -> str:
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "image/webp"
     return fallback
-
-
-def _as_image_data_uri(data: bytes, content_type: str = "") -> str:
-    """Encode image bytes as a single ``data:<mime>;base64,<payload>`` URI string.
-
-    Why this matters for Open WebUI tool calling: when a tool result is one whole
-    image data URI, Open WebUI moves it out of the model context into a chat
-    attachment and shows it inline. A base64 blob nested inside a JSON object
-    (the previous shape of this endpoint) is instead serialised into the tool
-    message as text, which can cost hundreds of thousands of tokens and leaves
-    the model unable to render it.
-    """
-    mime = content_type.split(";")[0].strip()
-    if not mime.startswith("image/"):
-        mime = _sniff_image_mime(data)
-    return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
 
 
 # Rendering a page with headless Chrome routinely takes longer than httpx's
@@ -404,14 +388,13 @@ async def _fetch_screenshot_bytes(
     responses={
         200: {
             "description": (
-                "Screenshot as a single image data URI string "
-                "(data:image/png;base64,...), ready to be attached by the client."
+                "The screenshot as raw PNG bytes (Content-Type: image/png). "
+                "Open WebUI base64-encodes non-text tool responses into an image "
+                "data URI and attaches it to the chat, keeping it out of the "
+                "model context. Do not wrap this in JSON: a text/plain or "
+                "application/json body is parsed as text and blows up the context."
             ),
-            "content": {
-                "text/plain": {
-                    "example": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg..."
-                }
-            },
+            "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}},
         }
     },
 )
@@ -444,31 +427,26 @@ async def get_screenshot(
             )
         raise
 
-    data_uri = _as_image_data_uri(data)
+    mime = _sniff_image_mime(data, fallback="image/png")
 
     if debug >= 1:
-        logger.info(
-            "%s debug summary requested for %s", LOG_TAG, unquote(url)
-        )
+        logger.info("%s debug summary requested for %s", LOG_TAG, unquote(url))
         return JSONResponse(
             content={
                 "ok": True,
                 "url": unquote(url),
-                "mime": _sniff_image_mime(data, fallback="(unknown)"),
+                "mime": mime,
                 "image_bytes": len(data),
-                "data_uri_chars": len(data_uri),
-                # Open WebUI turns the tool result into a chat attachment only when
-                # the whole result is one image data URI (see README).
-                "openwebui_data_uri_ok": data_uri.startswith("data:image/"),
-                "data_uri_preview": data_uri[:64] + "...",
+                "base64_chars_when_encoded": 4 * ((len(data) + 2) // 3),
+                "returned_as": f"{mime} bytes (Open WebUI encodes these itself)",
+                "magic_bytes": data[:8].hex(),
             }
         )
 
-    logger.info(
-        "screenshot %s -> %d bytes, data URI %d chars", url, len(data), len(data_uri)
-    )
-    # Returned as one whole data URI string, not wrapped in JSON.
-    return PlainTextResponse(content=data_uri, media_type="text/plain")
+    logger.info("screenshot %s -> %d bytes of %s", url, len(data), mime)
+    # Raw image bytes: Open WebUI turns a non-text tool response into an image
+    # data URI and attaches it, instead of injecting base64 into the context.
+    return Response(content=data, media_type=mime)
 
 
 # Pageshot endpoint
@@ -479,24 +457,21 @@ async def get_screenshot(
     responses={
         200: {
             "description": (
-                "Full page screenshot as a single image data URI string "
-                "(data:image/png;base64,...), ready to be attached by the client."
+                "The full page screenshot as raw PNG bytes (Content-Type: "
+                "image/png). Open WebUI base64-encodes non-text tool responses "
+                "into an image data URI and attaches it to the chat, keeping it "
+                "out of the model context. Note these can be several MB."
             ),
-            "content": {
-                "text/plain": {
-                    "example": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg..."
-                }
-            },
+            "content": {"image/png": {"schema": {"type": "string", "format": "binary"}}},
         }
     },
 )
 async def get_pageshot(url: str):
     data = await _fetch_screenshot_bytes(url, "pageshot")
-    data_uri = _as_image_data_uri(data)
-    logger.info(
-        "pageshot %s -> %d bytes, data URI %d chars", url, len(data), len(data_uri)
-    )
-    return PlainTextResponse(content=data_uri, media_type="text/plain")
+    mime = _sniff_image_mime(data, fallback="image/png")
+    logger.info("pageshot %s -> %d bytes of %s", url, len(data), mime)
+    # Raw image bytes, same contract as get_screenshot.
+    return Response(content=data, media_type=mime)
 
 
 @app.get(
@@ -587,23 +562,45 @@ async def debug_reader(
     url: str = Query(..., description="Target URL to screenshot, e.g. https://example.com/"),
     respond_with: str = Query("screenshot", description="X-Respond-With value"),
 ):
-    """Show exactly what the reader returns, instead of a bare 500.
+    """Show exactly what the reader returns *and* what a client sees from us.
 
     Open in a browser, e.g.
       /debug/reader?url=https://example.com/
       /debug/reader?respond_with=text&url=https://example.com/
-    The bare 'favicon.ico' probe is always included: it proves the Node process
-    is alive and serving *before* any headless Chrome is involved.
+    Includes the bare 'favicon.ico' probe (proves the Node process is alive
+    before any headless Chrome is involved) and a self-test of the tool
+    contract, which is what Open WebUI actually consumes.
     """
     logger.info("%s debug/reader requested for %s", LOG_TAG, url)
+
+    # What Open WebUI receives from OUR endpoint (not from the reader): this is
+    # the response whose Content-Type must not be text/plain or JSON.
+    try:
+        data = await _fetch_screenshot_bytes(url, respond_with)
+        mime = _sniff_image_mime(data, fallback="(unrecognised)")
+        tool_contract = {
+            "content_type_served": mime,
+            "bytes": len(data),
+            "ok": mime.startswith("image/"),
+            "note": (
+                "Open WebUI base64-encodes a non-text response into an image "
+                "data URI and attaches it; a text/plain or JSON body is parsed "
+                "as text instead and blows up the model context."
+            ),
+            "base64_chars_when_encoded": 4 * ((len(data) + 2) // 3),
+        }
+    except HTTPException as e:
+        tool_contract = {"ok": False, "status": e.status_code, "error": e.detail}
+
     result = {
         # No Chrome needed: if this fails, the reader process itself is unwell.
         "process_alive": await _proxy_to_reader("favicon.ico", limit=200),
-        "screenshot_request": await _proxy_to_reader(
+        "reader_handshake": await _proxy_to_reader(
             unquote(url),
             headers={"X-Respond-With": respond_with, "X-Timeout": "60"},
             limit=2000,
         ),
+        "tool_contract": tool_contract,
     }
     logger.info("%s debug/reader result: %s", LOG_TAG, result)
     return JSONResponse(content=result)
