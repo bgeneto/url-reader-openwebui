@@ -34,6 +34,19 @@ COPY backend/functions .
 # Build the application
 RUN npm run build
 
+# Work around --single-process: PuppeteerControl launches Chrome with it
+# (see src/services/puppeteer.ts), but modern Chrome no longer supports
+# single-process mode. The browser starts, logs "Browser launched: <pid>", then
+# dies on the first CDP target command:
+#   TargetCloseError: Protocol error (Target.createTarget): Target closed
+# That error is also emitted as an unhandled 'error' event, which kills the Node
+# process -> restart loop -> every crawl answers 500 in ~0.3s.
+# Strip the flag from the compiled output; the build fails if the pattern is
+# missing, so an upstream change cannot silently reintroduce the bug.
+RUN sed -i "s/'--single-process',//g" build/services/puppeteer.js \
+ && ! grep -q -- "--single-process" build/services/puppeteer.js \
+ && echo "patched: --single-process removed from build/services/puppeteer.js"
+
 # Create local storage directory and set permissions
 RUN mkdir -p /app/local-storage && chmod 777 /app/local-storage
 
